@@ -37,6 +37,7 @@ pub enum AddressingMode {
     Indirect_X,
     Indirect_Y,
     Indirect,
+    Accumulator,
 }
 
 #[derive(Clone)]
@@ -65,6 +66,7 @@ impl FromStr for OpCode {
             "absolute,Y" => AddressingMode::Absolute_Y,
             "(indirect,X)" => AddressingMode::Indirect_X,
             "(indirect),Y" => AddressingMode::Indirect_Y,
+            "accumulator" => AddressingMode::Accumulator,
             _ => AddressingMode::Indirect,
         };
         let operation = parts.next().unwrap();
@@ -197,27 +199,85 @@ impl CPU {
 
                 deref_base.wrapping_add(self.register_y as u16)
             }
-
-            AddressingMode::Indirect => {
+            _ => {
                 panic!("mode {:?} is not supported", mode);
             }
         }
     }
 
-    fn lda(&mut self, mode: &AddressingMode) {
-        let addr = self.get_operand_address(mode);
-        let value = self.mem_read(addr);
+    fn update_zero_and_negative_flags(&mut self, result: u8) {
+        // 0 flag
+        if result == 0 {
+            self.status |= 0b0000_0010;
+        } else {
+            self.status &= 0b1111_1101;
+        }
 
-        self.register_a = value;
-        self.update_zero_and_negative_flags(self.register_a);
-        // dbg!(self.register_a);
+        // negative flag
+        if result & 0x80 != 0 {
+            self.status |= 0b1000_0000;
+        } else {
+            self.status &= 0b0111_1111;
+        }
     }
 
-    fn tax(&mut self) {
-        self.register_x = self.register_a;
-        self.update_zero_and_negative_flags(self.register_x);
-        // dbg!(self.register_a);
-        // dbg!(self.register_x);
+    fn update_carry_flag(&mut self, x: u8, y: u8, result: u8) {
+        // Set the carry flag if either...
+        // 8th bit of both x and y are 1 OR
+        // 8th bit of one of x or y was 1 and result was 0 (meaning we got
+        // a carry from bit 7)
+        if x & y & 0x80 != 0 || ((x ^ y) & 0x80 != 0 && result & 0x80 == 0) {
+            self.status |= 0b0000_0001;
+        } else {
+            self.status &= 0b1111_1110;
+        }
+    }
+
+    fn update_overflow_flag(&mut self, x: u8, y: u8, result: u8) {
+        // if the sign of both inputs is different from the sign of the result
+        // (http://www.righto.com/2012/12/the-6502-overflow-flag-explained.html)
+        if (x ^ result) & (y ^ result) & 0x80 != 0 {
+            self.status |= 0b0100_0000;
+        } else {
+            self.status &= 0b1011_1111;
+        }
+    }
+
+    fn _perform_add(&mut self, original_a: u8, to_add: u8) {
+        let to_add_with_carry = to_add.wrapping_add(self.status & 0b0000_0001);
+        self.register_a = self.register_a.wrapping_add(to_add_with_carry);
+        self.update_zero_and_negative_flags(self.register_a);
+        self.update_carry_flag(original_a, to_add_with_carry, self.register_a);
+        self.update_overflow_flag(original_a, to_add_with_carry, self.register_a);
+    }
+
+    fn adc(&mut self, mode: &AddressingMode) {
+        let to_add = self.mem_read(self.get_operand_address(mode));
+        self._perform_add(self.register_a, to_add);
+    }
+
+    fn and(&mut self, mode: &AddressingMode) {
+        let value = self.mem_read(self.get_operand_address(mode));
+
+        self.register_a &= value;
+        self.update_zero_and_negative_flags(self.register_a);
+    }
+
+    fn asl(&mut self, mode: &AddressingMode) {
+        let original_value;
+        let new_value;
+        if matches!(mode, AddressingMode::Accumulator) {
+            original_value = self.register_a;
+            self.register_a <<= 1;
+            new_value = self.register_a;
+        } else {
+            let address = self.get_operand_address(mode);
+            original_value = self.mem_read(address);
+            new_value = original_value << 1;
+            self.mem_write(address, new_value);
+        }
+        self.update_zero_and_negative_flags(new_value);
+        self.update_carry_flag(original_value, original_value, new_value);
     }
 
     fn brk(&mut self) {
@@ -229,22 +289,70 @@ impl CPU {
         self.update_zero_and_negative_flags(self.register_x);
     }
 
-    fn update_zero_and_negative_flags(&mut self, result: u8) {
-        if result == 0 {
-            self.status |= 0b0000_0010;
-        } else {
-            self.status &= 0b1111_1101;
-        }
+    fn jmp(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        self.program_counter = addr;
+    }
 
-        if result & 0b1000_0000 != 0 {
-            self.status |= 0b1000_0000;
-        } else {
-            self.status &= 0b0111_1111;
-        }
+    fn lda(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let value = self.mem_read(addr);
+
+        self.register_a = value;
+        self.update_zero_and_negative_flags(self.register_a);
+    }
+
+    fn ldx(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let value = self.mem_read(addr);
+
+        self.register_x = value;
+        self.update_zero_and_negative_flags(self.register_x);
+    }
+
+    fn ldy(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        let value = self.mem_read(addr);
+
+        self.register_y = value;
+        self.update_zero_and_negative_flags(self.register_y);
+    }
+
+    fn sbc(&mut self, mode: &AddressingMode) {
+        // "Come on" said Professor Perdikaris as I slept through the ones complement and
+        // twos complement section of my digital logic class
+        let original_a = self.register_a;
+        let to_subtract = self.mem_read(self.get_operand_address(mode));
+        self._perform_add(original_a, !to_subtract);
+    }
+
+    fn sec(&mut self) {
+        self.status |= 0b0000_0001;
+    }
+
+    fn sta(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        self.mem_write(addr, self.register_a);
+    }
+
+    fn stx(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        self.mem_write(addr, self.register_x);
+    }
+
+    fn sty(&mut self, mode: &AddressingMode) {
+        let addr = self.get_operand_address(mode);
+        self.mem_write(addr, self.register_y);
+    }
+
+    fn tax(&mut self) {
+        self.register_x = self.register_a;
+        self.update_zero_and_negative_flags(self.register_x);
     }
 
     pub fn run(&mut self) {
         loop {
+            println!("{:#04x}", &self.program_counter);
             // dbg!(&self.program_counter);
             let code = self.mem_read(self.program_counter);
             self.program_counter += 1;
@@ -257,17 +365,32 @@ impl CPU {
             let opcode = self.opcodes[opcode_index].clone();
 
             // dbg!(code);
-            // dbg!(&opcode.name);
+            dbg!(&opcode.name);
 
             match opcode.name.as_str() {
+                "ADC" => self.adc(&opcode.mode),
+                "AND" => self.and(&opcode.mode),
+                "ASL" => self.asl(&opcode.mode),
                 "BRK" => {
                     self.brk();
                     return;
                 }
                 "INX" => self.inx(),
+                "JMP" => {
+                    self.jmp(&opcode.mode);
+                    continue; // Ensure we don't increment program counter
+                }
                 "LDA" => self.lda(&opcode.mode),
+                "LDX" => self.ldx(&opcode.mode),
+                "LDY" => self.ldy(&opcode.mode),
+                "NOP" => {}
+                "SBC" => self.sbc(&opcode.mode),
+                "SEC" => self.sec(),
+                "STA" => self.sta(&opcode.mode),
+                "STX" => self.stx(&opcode.mode),
+                "STY" => self.sty(&opcode.mode),
                 "TAX" => self.tax(),
-                _ => panic!("at the disco"),
+                _ => panic!("Bad opcode: {}", opcode.name.as_str()),
             }
 
             self.program_counter += (opcode.bytes - 1) as u16;
@@ -282,7 +405,7 @@ impl Default for CPU {
 }
 
 fn main() {
-    dbg!("hi");
+    println!("hi");
 }
 
 #[cfg(test)]
@@ -290,7 +413,132 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_0xa9_lda_immediate_load_data() {
+    fn test_69_adc_immediate() {
+        // Use the values from the table in
+        // http://www.righto.com/2012/12/the-6502-overflow-flag-explained.html
+        // to ensure we're setting negative, carry and overflow flags correctly
+
+        // 1s from left to right: Negative, overflow, carry
+        let check_bits = 0b1100_0001;
+
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0x50, 0x69, 0x10]);
+        assert_eq!(cpu.register_a, 0x60);
+        assert_eq!(cpu.status & check_bits, 0);
+
+        cpu.load_and_run(vec![0xa9, 0x50, 0x69, 0x50]);
+        assert_eq!(cpu.register_a, 0xa0);
+        assert_eq!(cpu.status & check_bits, 0b1100_0000);
+
+        cpu.load_and_run(vec![0xa9, 0x50, 0x69, 0x90]);
+        assert_eq!(cpu.register_a, 0xe0);
+        assert_eq!(cpu.status & check_bits, 0b1000_0000);
+
+        cpu.load_and_run(vec![0xa9, 0x50, 0x69, 0xd0]);
+        assert_eq!(cpu.register_a, 0x20);
+        assert_eq!(cpu.status & check_bits, 0b0000_0001);
+
+        cpu.load_and_run(vec![0xa9, 0xd0, 0x69, 0x10]);
+        assert_eq!(cpu.register_a, 0xe0);
+        assert_eq!(cpu.status & check_bits, 0b1000_0000);
+
+        cpu.load_and_run(vec![0xa9, 0xd0, 0x69, 0x50]);
+        assert_eq!(cpu.register_a, 0x20);
+        assert_eq!(cpu.status & check_bits, 0b0000_0001);
+
+        cpu.load_and_run(vec![0xa9, 0xd0, 0x69, 0x90]);
+        assert_eq!(cpu.register_a, 0x60);
+        assert_eq!(cpu.status & check_bits, 0b0100_0001);
+
+        cpu.load_and_run(vec![0xa9, 0xd0, 0x69, 0xd0]);
+        assert_eq!(cpu.register_a, 0xa0);
+        assert_eq!(cpu.status & check_bits, 0b1000_0001);
+
+        // Test with carry
+        // Result of first add should be 0x20 + carry, so next add should result in 0x22
+        cpu.load_and_run(vec![0xa9, 0x50, 0x69, 0xd0, 0x69, 0x01]);
+        assert_eq!(cpu.register_a, 0x22);
+        assert_eq!(cpu.status & check_bits, 0);
+    }
+
+    #[test]
+    fn test_a9_and_immediate() {
+        // LDA #$03
+        // AND #$06
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0b0000_0011, 0x29, 0b0000_0110]);
+        assert_eq!(cpu.register_a, 0b0000_0010);
+    }
+
+    #[test]
+    fn test_0a_asl_accumulator() {
+        // LDA #$03
+        // ASL
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0b0000_0011, 0x0a]);
+        assert_eq!(cpu.register_a, 0b0000_0110);
+    }
+
+    #[test]
+    fn test_06_asl_zero_page() {
+        // LDA #$03
+        // STA $02
+        // ASL $02
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0b0000_0011, 0x85, 0x02, 0x06, 0x02]);
+        let result = cpu.mem_read(0x02);
+        assert_eq!(result, 0b0000_0110);
+    }
+
+    #[test]
+    fn test_asl_carry_flag() {
+        // LDA #$80
+        // ASL
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0b1000_0000, 0x0a]);
+        assert_eq!(cpu.register_a, 0);
+        assert_eq!(cpu.status & 0b0000_0001, 0b0000_0001);
+    }
+
+    #[test]
+    fn test_00_brk_flag() {
+        // BRK
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0x00]);
+        assert!(cpu.status & 0b0001_0000 == 0b0001_0000);
+    }
+
+    #[test]
+    fn test_inx_overflow() {
+        // LDA #$0xff
+        // TAX
+        // INX
+        // INX
+        // BRK
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0xff, 0xaa, 0xe8, 0xe8, 0x00]);
+
+        assert_eq!(cpu.register_x, 1)
+    }
+
+    #[test]
+    fn test_4c_jmp_absolute() {
+        // PC starts at 8000, LDA is 2 bytes, JMP is 3 bytes, LDA is 2 bytes,
+        // so jump to $8007 (in little endian)
+        // LDA #$03
+        // JMP $8007
+        // LDA #$10  // Should get skipped
+        // LDX #$05
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0x03, 0x4c, 0x07, 0x80, 0xa9, 0x10, 0xa2, 0x05]);
+        assert_eq!(cpu.register_a, 0x03);
+        assert_eq!(cpu.register_x, 0x05);
+    }
+
+    #[test]
+    fn test_a9_lda_immediate_load_data() {
+        // LDA #$05
+        // BRK
         let mut cpu = CPU::new();
         cpu.load_and_run(vec![0xa9, 0x05, 0x00]);
         assert_eq!(cpu.register_a, 0x05);
@@ -299,60 +547,105 @@ mod test {
     }
 
     #[test]
-    fn test_0xa9_lda_zero_flag() {
+    fn test_a5_lda_zero_page() {
+        // LXD #$55
+        // STX $02
+        // LDA $02
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa2, 0x55, 0x86, 0x02, 0xa5, 0x02]);
+
+        assert_eq!(cpu.register_a, 0x55);
+    }
+
+    #[test]
+    fn test_a9_lda_zero_flag() {
+        // LDA #$00
+        // BRK
         let mut cpu = CPU::new();
         cpu.load_and_run(vec![0xa9, 0x00, 0x00]);
         assert!(cpu.status & 0b0000_0010 == 0b10);
     }
 
     #[test]
-    fn test_0xa9_lda_negative_flag() {
+    fn test_a9_lda_negative_flag() {
+        // LDA #$ff
+        // BRK
         let mut cpu = CPU::new();
         cpu.load_and_run(vec![0xa9, 0xff, 0x00]);
         assert!(cpu.status & 0b1000_0000 == 0b1000_0000);
     }
 
     #[test]
-    fn test_00_brk_flag() {
+    fn test_e9_sbc_immediate() {
+        // Use table at http://www.righto.com/2012/12/the-6502-overflow-flag-explained.html
+        // to test borrow bit and underflow
+
+        // 1s from left to right: Negative, overflow, carry
+        let check_bits = 0b1100_0001;
+
         let mut cpu = CPU::new();
-        cpu.load_and_run(vec![0x00]);
-        assert!(cpu.status & 0b0001_0000 == 0b0001_0000);
+        cpu.load_and_run(vec![0x38, 0xa9, 0x50, 0xe9, 0xf0]);
+        assert_eq!(cpu.register_a, 0x60);
+        assert_eq!(cpu.status & check_bits, 0);
+
+        cpu.load_and_run(vec![0x38, 0xa9, 0x50, 0xe9, 0xb0]);
+        assert_eq!(cpu.register_a, 0xa0);
+        assert_eq!(cpu.status & check_bits, 0b1100_0000);
+
+        cpu.load_and_run(vec![0x38, 0xa9, 0x50, 0xe9, 0x70]);
+        assert_eq!(cpu.register_a, 0xe0);
+        assert_eq!(cpu.status & check_bits, 0b1000_0000);
+
+        cpu.load_and_run(vec![0x38, 0xa9, 0x50, 0xe9, 0x30]);
+        assert_eq!(cpu.register_a, 0x20);
+        assert_eq!(cpu.status & check_bits, 0b0000_0001);
+
+        cpu.load_and_run(vec![0x38, 0xa9, 0xd0, 0xe9, 0xf0]);
+        assert_eq!(cpu.register_a, 0xe0);
+        assert_eq!(cpu.status & check_bits, 0b1000_0000);
+
+        cpu.load_and_run(vec![0x38, 0xa9, 0xd0, 0xe9, 0xb0]);
+        assert_eq!(cpu.register_a, 0x20);
+        assert_eq!(cpu.status & check_bits, 0b0000_0001);
+
+        cpu.load_and_run(vec![0x38, 0xa9, 0xd0, 0xe9, 0x70]);
+        assert_eq!(cpu.register_a, 0x60);
+        assert_eq!(cpu.status & check_bits, 0b0100_0001);
+
+        cpu.load_and_run(vec![0x38, 0xa9, 0xd0, 0xe9, 0x30]);
+        assert_eq!(cpu.register_a, 0xa0);
+        assert_eq!(cpu.status & check_bits, 0b1000_0001);
     }
 
     #[test]
-    fn test_0xaa_tax_move_a_to_x() {
+    fn test_85_sta_zero_page() {
+        // LDA #$03
+        // STA $02
         let mut cpu = CPU::new();
-        cpu.load_and_run(vec![0xa9, 10, 0xaa, 0x00]);
-
-        assert_eq!(cpu.register_x, 10)
+        cpu.load_and_run(vec![0xa9, 0x03, 0x85, 0x02]);
+        let result = cpu.mem_read(0x02);
+        assert_eq!(result, 0x03);
     }
 
     #[test]
-    fn test_5_ops_working_together() {
+    fn test_aa_tax_move_a_to_x() {
+        // LDA #$10
+        // TAX
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0x10, 0xaa, 0x00]);
+
+        assert_eq!(cpu.register_x, 0x10)
+    }
+
+    #[test]
+    fn test_ops_working_together() {
+        // LDA #$c0
+        // TAX
+        // INX
+        // BRK
         let mut cpu = CPU::new();
         cpu.load_and_run(vec![0xa9, 0xc0, 0xaa, 0xe8, 0x00]);
 
         assert_eq!(cpu.register_x, 0xc1)
     }
-
-    #[test]
-    fn test_inx_overflow() {
-        let mut cpu = CPU::new();
-        // cpu.register_x = 0xff;
-        cpu.load_and_run(vec![0xa9, 0xff, 0xaa, 0xe8, 0xe8, 0x00]);
-
-        assert_eq!(cpu.register_x, 1)
-    }
-
-    #[test]
-    fn test_lda_from_memory() {
-        let mut cpu = CPU::new();
-        cpu.mem_write(0x10, 0x55);
-
-        cpu.load_and_run(vec![0xa5, 0x10, 0x00]);
-
-        assert_eq!(cpu.register_a, 0x55);
-    }
-
-    // Should test TAX status flags
 }
