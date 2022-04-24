@@ -150,7 +150,7 @@ impl CPU {
     // }
 
     pub fn push_stack(&mut self, data: u8) {
-        dbg!(self.stack_pointer);
+        // dbg!(self.stack_pointer);
         if self.stack_pointer < 0x0100 {
             panic!("stack overflow!");
         }
@@ -181,8 +181,15 @@ impl CPU {
     }
 
     pub fn load(&mut self, program: Vec<u8>) {
-        self.memory[0x8000..(0x8000 + program.len())].copy_from_slice(&program[..]);
-        self.mem_write_u16(0xFFFC, 0x8000);
+        self.load_to_address(program, 0x8000);
+    }
+
+    pub fn load_to_address(&mut self, program: Vec<u8>, address: usize) {
+        // Ungh...why no function overloading?
+        // NES ROMs load at 0x8000, but looks like "normal" 6502 loads from 0x0600, so
+        // we have a separate function to support that
+        self.memory[address..(address + program.len())].copy_from_slice(&program[..]);
+        self.mem_write_u16(0xFFFC, address as u16);
     }
 
     pub fn load_and_run(&mut self, program: Vec<u8>) {
@@ -200,6 +207,8 @@ impl CPU {
             AddressingMode::ZeroPage => self.mem_read(self.program_counter) as u16,
 
             AddressingMode::Absolute => self.mem_read_u16(self.program_counter),
+
+            AddressingMode::Accumulator => self.register_a as u16,
 
             AddressingMode::ZeroPage_X => {
                 let pos = self.mem_read(self.program_counter);
@@ -348,9 +357,11 @@ impl CPU {
         // AND the accumlator with the passed value and use that value to set the zero bit
         // Unrelated to that set the negative and overflow flags based on the passed value
         let value = self.mem_read(self.get_operand_address(mode));
-        let new_zero = self.register_a & value & FLAG_ZERO;
-        let new_others = value & 0b1100_0000;
-        self.status |= new_zero | new_others;
+        let updated_bits = value & 0b1100_0000;
+        if self.register_a & value == 0 {
+            self.status |= FLAG_ZERO;
+        }
+        self.status |= updated_bits;
     }
 
     fn bmi(&mut self, mode: &AddressingMode) {
@@ -406,16 +417,15 @@ impl CPU {
 
     fn _cmp_register(&mut self, mode: &AddressingMode, register: u8) {
         let value = self.mem_read(self.get_operand_address(mode));
-        let result = register.wrapping_sub(value) as i8;
-        if result >= 0 {
-            self.status &= FLAG_CARRY;
-            if result == 0 {
-                self.status &= FLAG_ZERO;
+        self.status &= 0b0111_1100; // Clear relevant status flags
+        if register >= value {
+            self.status |= FLAG_CARRY;
+            if register == value {
+                self.status |= FLAG_ZERO;
             }
-        } else if result < 0 {
-            self.status &= FLAG_NEGATIVE;
-        } else {
-            panic!("This shouldn't happen");
+        }
+        if (register.wrapping_sub(value) as i8) < 0 {
+            self.status |= FLAG_NEGATIVE;
         }
     }
 
@@ -660,7 +670,7 @@ impl CPU {
     {
         loop {
             callback(self);
-            println!("PC: {:#04x}", &self.program_counter);
+            // println!("PC: {:#04x}", &self.program_counter);
             let code = self.mem_read(self.program_counter);
             self.program_counter += 1;
 
@@ -680,7 +690,7 @@ impl CPU {
                 "ASL" => self.asl(&opcode.mode),
                 "BCC" => self.bcc(&opcode.mode),
                 "BCS" => self.bcs(&opcode.mode),
-                "BEG" => self.beq(&opcode.mode),
+                "BEQ" => self.beq(&opcode.mode),
                 "BIT" => self.bit(&opcode.mode),
                 "BMI" => self.bmi(&opcode.mode),
                 "BNE" => self.bne(&opcode.mode),
@@ -865,6 +875,37 @@ mod test {
     }
 
     #[test]
+    fn test_24_bit_zeropage() {
+        // LDA #$00
+        // STA $02
+        // LDA #$03
+        // BIT $02
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0x00, 0x85, 0x02, 0xa9, 0x03, 0x24, 0x02]);
+        assert_eq!(cpu.status & FLAG_ZERO, FLAG_ZERO);
+        assert_eq!(cpu.status & FLAG_OVERFLOW, 0);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, 0);
+
+        // LDA #$80
+        // STA $02
+        // LDA #$80
+        // BIT $02
+        cpu.load_and_run(vec![0xa9, 0x80, 0x85, 0x02, 0xa9, 0x80, 0x24, 0x02]);
+        assert_eq!(cpu.status & FLAG_ZERO, 0);
+        assert_eq!(cpu.status & FLAG_OVERFLOW, 0);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, FLAG_NEGATIVE);
+
+        // LDA #$80
+        // STA $02
+        // LDA #$40
+        // BIT $02
+        cpu.load_and_run(vec![0xa9, 0x80, 0x85, 0x02, 0xa9, 0x40, 0x24, 0x02]);
+        assert_eq!(cpu.status & FLAG_ZERO, FLAG_ZERO);
+        assert_eq!(cpu.status & FLAG_OVERFLOW, 0);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, FLAG_NEGATIVE);
+    }
+
+    #[test]
     fn test_00_brk() {
         // BRK
         let mut cpu = CPU::new();
@@ -873,11 +914,54 @@ mod test {
     }
 
     #[test]
+    fn test_c9_cmp() {
+        // LDA #$02
+        // CMP #$02
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0x02, 0xc9, 0x02]);
+        assert_eq!(cpu.status & FLAG_CARRY, FLAG_CARRY);
+        assert_eq!(cpu.status & FLAG_ZERO, FLAG_ZERO);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, 0);
+
+        // LDA #$02
+        // CMP #$01
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0x02, 0xc9, 0x01]);
+        assert_eq!(cpu.status & FLAG_CARRY, FLAG_CARRY);
+        assert_eq!(cpu.status & FLAG_ZERO, 0);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, 0);
+
+        // LDA #$02
+        // CMP #$03
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0x02, 0xc9, 0x03]);
+        assert_eq!(cpu.status & FLAG_CARRY, 0);
+        assert_eq!(cpu.status & FLAG_ZERO, 0);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, FLAG_NEGATIVE);
+
+        // LDA #$ff
+        // CMP #$03
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0xff, 0xc9, 0x03]);
+        assert_eq!(cpu.status & FLAG_CARRY, FLAG_CARRY);
+        assert_eq!(cpu.status & FLAG_ZERO, 0);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, FLAG_NEGATIVE);
+
+        // LDA #$ff
+        // CMP #$03
+        let mut cpu = CPU::new();
+        cpu.load_and_run(vec![0xa9, 0xff, 0xc9, 0xff]);
+        assert_eq!(cpu.status & FLAG_CARRY, FLAG_CARRY);
+        assert_eq!(cpu.status & FLAG_ZERO, FLAG_ZERO);
+        assert_eq!(cpu.status & FLAG_NEGATIVE, 0);
+    }
+
+    #[test]
     fn test_ce_dec_absolute() {
-        // LDA #$0x09 (a9)
-        // STA $0x0123 (8d)
-        // DEC $0x0123 (ce)
-        // LDA $0x0123 (ad)
+        // LDA #$09 (a9)
+        // STA $0123 (8d)
+        // DEC $0123 (ce)
+        // LDA $0123 (ad)
         let mut cpu = CPU::new();
         cpu.load_and_run(vec![
             0xa9, 0x09, 0x8d, 0x23, 0x01, 0xce, 0x23, 0x01, 0xad, 0x23, 0x01,

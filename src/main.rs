@@ -70,6 +70,7 @@ fn read_screen_state(cpu: &CPU, frame: &mut [u8; 32 * 3 * 32]) -> bool {
         }
         frame_idx += 3;
     }
+    // println!("{:?}", frame);
     update
 }
 
@@ -119,7 +120,7 @@ fn main() {
 
     // Load the game
     let mut cpu = CPU::new();
-    cpu.load(game_code);
+    cpu.load_to_address(game_code, 0x0600);
     cpu.reset();
 
     // run the game cycle
